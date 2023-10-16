@@ -2,6 +2,10 @@
 
 """Megatron tokenizers."""
 
+import re
+import six
+import numpy as np
+
 from abc import ABC
 from abc import abstractmethod
 
@@ -13,6 +17,10 @@ def build_tokenizer(args):
     if args.rank == 0:
         print('> building {} tokenizer ...'.format(args.tokenizer_type),
               flush=True)
+
+    if args.tokenizer_type not in \
+        ["SentencePieceTokenizer", "MixedTokenizer", 'GPTSentencePieceTokenizer', 'UL2SentencePieceTokenizer', 'LLaMaSentencePieceTokenizer']:
+        assert args.vocab_file is not None
 
     # Select and instantiate the tokenizer.
     if args.tokenizer_type == 'BertWordPieceLowerCase':
@@ -32,9 +40,24 @@ def build_tokenizer(args):
     elif args.tokenizer_type == 'SentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _SentencePieceTokenizer(args.tokenizer_model, vocab_extra_ids=args.vocab_extra_ids)
+    elif args.tokenizer_type == "MixedTokenizer":
+        assert args.tokenizer_file is not None
+        assert args.tokenizer_model is not None
+        tokenizer = _MixedTokenizer(args.tokenizer_model, args.tokenizer_file)
     elif args.tokenizer_type == 'GPTSentencePieceTokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _GPTSentencePieceTokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'LLaMaSentencePieceTokenizer':
+        assert args.tokenizer_model is not None
+        tokenizer = _LLaMaSentencePieceTokenizer(args.tokenizer_model)
+    elif args.tokenizer_type == 'UL2SentencePieceTokenizer':
+        assert args.tokenizer_model is not None
+        if args.rank == 0:
+            print(f"Build UL2SentencePieceTokenizer with {args.vocab_extra_ids} extra ids.")
+        tokenizer = _UL2SentencePieceTokenizer(
+            args.tokenizer_model,
+            vocab_extra_ids=args.vocab_extra_ids
+        )
     elif args.tokenizer_type == 'Llama2Tokenizer':
         assert args.tokenizer_model is not None
         tokenizer = _Llama2Tokenizer(args.tokenizer_model)
@@ -60,6 +83,7 @@ def _vocab_size_with_padding(orig_vocab_size, args):
     after = orig_vocab_size
     multiple = args.make_vocab_size_divisible_by * \
         args.tensor_model_parallel_size
+
     while (after % multiple) != 0:
         after += 1
     if args.rank == 0:
@@ -67,6 +91,226 @@ def _vocab_size_with_padding(orig_vocab_size, args):
               '(new size: {})'.format(
                   orig_vocab_size, after - orig_vocab_size, after), flush=True)
     return after
+
+
+def convert_to_unicode(text):
+    r"""
+    Converts `text` to Unicode (if it is not already), assuming utf-8 input.
+    """
+
+    if six.PY3:
+        if isinstance(text, str):
+            return text
+        elif isinstance(text, bytes):
+            return text.decode("utf-8", "ignore")
+        else:
+            raise ValueError("Unsupported string type: {}".format(type(text)))
+    else:
+        raise ValueError("The tokenizer must run on Python 3")
+
+
+class _MixedTokenizer():
+    r"""Mixed tokenier for Chinese and Non-Chinese text:
+    Chinese: Byte-Level BPE tokenizer,
+    Non-Chinese: SentencePiece tokenizer.
+    """
+
+    def __init__(self,
+                 tokenizer_en_model: str,
+                 tokenizer_zh_file: str):
+        from sentencepiece import SentencePieceProcessor
+        from tokenizers import Tokenizer
+
+        self.zh_pattern = re.compile("[^\x00-\xff]+")
+        self.en_pattern = re.compile("[\x00-\xff]+")
+        self.en_tokenizer = SentencePieceProcessor(
+            model_file=tokenizer_en_model
+        )
+        self.zh_tokenizer = Tokenizer.from_file(tokenizer_zh_file)
+
+        self.en_num_vocab = self.en_tokenizer.vocab_size()
+        self.zh_num_vocab = self.zh_tokenizer.get_vocab_size()
+        self.num_vocab = self.en_num_vocab + self.zh_num_vocab - 81
+
+        # initialization
+        self._initialize()
+
+    def _initialize(self):
+        self._bos_token = "<s>"
+        self._eos_token = "</s>"
+        self._pad_token = "<unk>"
+        self._unk_token = "<unk>"
+
+        self._bos_id = self.en_tokenizer.piece_to_id(self._bos_token)
+        self._eos_id = self.en_tokenizer.piece_to_id(self._eos_token)
+        self._pad_id = self.en_tokenizer.piece_to_id(self._pad_token)
+        self._unk_id = self.en_tokenizer.piece_to_id(self._unk_token)
+        self.special_token_num = 3
+
+        self._vocab = {}
+        self._inv_vocab = {}
+        self._zh_inverse_vocab = {}
+        vocab_zh = self.zh_tokenizer.get_vocab()
+
+        for i in range(len(self.en_tokenizer)):
+            t = self.en_tokenizer.id_to_piece(i)
+            self._inv_vocab[i] = t
+            self._vocab[t] = i
+
+        for t in vocab_zh:
+            if vocab_zh[t] >= self.en_num_vocab:
+                assert vocab_zh[t] not in self._inv_vocab
+                self._inv_vocab[vocab_zh[t]] = t
+                self._vocab[t] = vocab_zh[t]
+
+        assert len(self._vocab) == self.num_vocab
+        assert len(self._inv_vocab) == self.num_vocab
+
+        for t in vocab_zh:
+            if vocab_zh[t] >= self.special_token_num:
+                self._zh_inverse_vocab[vocab_zh[t]] = t
+
+    def tokenize(self, text, bos=True, eos=True):
+        unicode_str = convert_to_unicode(text)
+        length = len(unicode_str)
+
+        if length == 0:
+            print("Warning: the text to be tokenized is empty", flush=True)
+            return []
+
+        p = 0
+        outputs = []
+
+        if bos:
+            outputs = [self._bos_id]
+
+        while p < length:
+            if "\x00" <= unicode_str[p] <= "\xff":
+                r"""Non-Chinese string"""
+                matched_res = self.en_pattern.match(unicode_str, p)
+                matched_text = matched_res.group()
+                p = matched_res.span()[1]
+
+                # tokenization
+                outs = self.en_tokenizer.encode(matched_text, out_type=int)
+                outputs.extend(outs)
+            else:
+                r"""Chinese string"""
+                matched_res = self.zh_pattern.match(unicode_str, p)
+                matched_text = matched_res.group()
+                p = matched_res.span()[1]
+
+                # tokenization
+                encoded_res = self.zh_tokenizer.encode(matched_text)
+                outputs.extend(encoded_res.ids)
+
+        if eos:
+            outputs.append(self._eos_id)
+
+        return outputs
+
+    def detokenize(self, ids, skip_special_tokens=True):
+        if len(ids) == 0:
+            return ""
+
+        output_str_list = []
+        now_is_chinese = (ids[0] >= self.en_num_vocab)
+        ids2decode = [ids[0]]
+
+        for i in ids[1:]:
+            if i in self.zh_inv_vocab:
+                if now_is_chinese:
+                    ids2decode.append(i)
+                else:
+                    if i >= self.en_num_vocab:
+                        output_str_list.append(
+                            self.en_tokenizer.decode(ids2decode)
+                        )
+                        ids2decode = [i]
+                        now_is_chinese = True
+                    else:
+                        ids2decode.append(i)
+            else:
+                if now_is_chinese:
+                    output_str_list.append(
+                        self.zh_tokenizer.decode(
+                            ids2decode,
+                            skip_special_tokens=skip_special_tokens
+                        )
+                    )
+                    ids2decode = [i]
+                    now_is_chinese = False
+                else:
+                    ids2decode.append(i)
+
+        # deocde the remaining ids
+        if now_is_chinese:
+            output_str_list.append(
+                self.zh_tokenizer.decode(
+                    ids2decode,
+                    skip_special_tokens=skip_special_tokens
+                )
+            )
+        else:
+            output_str_list.append(self.en_tokenizer.decode(ids2decode))
+
+        return "".join(output_str_list)
+
+    @property
+    def vocab_size(self):
+        return self.num_vocab
+
+    @property
+    def zh_inv_vocab(self):
+        return self._zh_inverse_vocab
+
+    @property
+    def inv_vocab(self):
+        return self._inv_vocab
+
+    @property
+    def vocab(self):
+        return self._vocab
+
+    @property
+    def unk(self):
+        return self._unk_id
+
+    @property
+    def unk_token_id(self):
+        return self._unk_id
+
+    @property
+    def pad(self):
+        return self._pad_id
+
+    @property
+    def pad_token_id(self):
+        return self._pad_id
+
+    @property
+    def bos_token_id(self):
+        return self._bos_id
+
+    @property
+    def bos(self):
+        return self._bos_id
+
+    @property
+    def eos_token_id(self):
+        return self._eos_id
+
+    @property
+    def eos(self):
+        return self._eos_id
+
+    @property
+    def eod_token_id(self):
+        return self._eos_id
+
+    @property
+    def eod(self):
+        return self._eos_id
 
 
 class AbstractTokenizer(ABC):
@@ -296,7 +540,7 @@ class _SentencePieceTokenizer(AbstractTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
     def __init__(self, model_file, vocab_extra_ids=0):
-        name = 'SentencePieceTokenizer'
+        name = "SentencePieceTokenizer"
         super().__init__(name)
 
         import sentencepiece
@@ -466,6 +710,7 @@ class _SentencePieceTokenizer(AbstractTokenizer):
     def additional_special_tokens_ids(self):
         return [self.vocab[k] for k in self._t5_tokens]
 
+
 class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
 
@@ -474,16 +719,92 @@ class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
 
     def _initalize(self, vocab_extra_ids):
         self._populate_vocab()
+        self._special_tokens = {}
+        self._inv_special_tokens = {}
 
-        self._pad_id = self.tokenizer.pad_id()
-        self._bos_id = self.tokenizer.bos_id()
-        self._eos_id = self.tokenizer.eos_id()
+        # self._pad_id = self.tokenizer.pad_id()
+        # self._bos_id = self.tokenizer.bos_id()
+        # self._eos_id = self.tokenizer.eos_id()
+        
+        def _add_special_token(t):
+            if t not in self._vocab:
+                next_id = len(self._vocab)
+                self._vocab[t] = next_id
+                self._inv_vocab[next_id] = t
+            self._special_tokens[t] = self._vocab[t]
+            self._inv_special_tokens[self._vocab[t]] = t
+        
+        # Set pad id / bos id / eos id
+        self._pad_id = 0
+        bos_id = self.tokenizer.bos_id()
+        try:
+            bos_token = self.tokenizer.id_to_piece(bos_id)
+        except IndexError:
+            bos_token = "<!!BOS!!>"
+        _add_special_token(bos_token)
+        self._bos_id = self._vocab[bos_token]
 
-    def tokenize(self, text):
-        return self.tokenizer.encode_as_ids(text)
+        eos_id = self.tokenizer.eos_id()
+        try:
+            eos_token = self.tokenizer.id_to_piece(eos_id)
+        except IndexError:
+            eos_token = "<!!EOS!!>"
+        _add_special_token(eos_token)
+        self._eos_id = self._vocab[eos_token]
+
+        # Add other special tokens
+        _add_special_token("<!!UNK!!>")
+        _add_special_token("<!!USR!!>")
+        _add_special_token("<!!AST!!>")
+        _add_special_token("<!!SYS!!>")
+        _add_special_token("<!!REPO!!>")
+        _add_special_token("<!!FILE!!>")
+        for i in range(10):
+            _add_special_token(f"<!!SP{i}!!>")
+
+    def tokenize(self, text, bos=False, eos=False):
+        ids = []
+        idx = 0
+
+        if bos:
+            ids.append(self._bos_id)
+
+        while 1:
+            indices = {}
+            for token in self._special_tokens:
+                try:
+                    indices[token] = text[idx:].index(token)
+                except ValueError:
+                    continue
+            if len(indices) == 0:
+                break
+
+            next_token = min(indices, key=indices.get)
+            next_idx = idx + indices[next_token]
+
+            ids.extend(self.tokenizer.encode_as_ids(text[idx:next_idx]))
+            ids.append(self._special_tokens[next_token])
+            idx = next_idx + len(next_token)
+
+        ids.extend(self.tokenizer.encode_as_ids(text[idx:]))
+        
+        if eos:
+            ids.append(self._eos_id)
+
+        return ids
 
     def detokenize(self, ids):
-        return self.tokenizer.decode_ids(ids)
+        text = ""
+        last_i = 0
+
+        for i, id in enumerate(ids):
+            if id in self._inv_special_tokens:
+                text += self.tokenizer.decode_ids(ids[last_i:i]) # + " "
+                text += self._inv_special_tokens[id] # + " "
+                last_i = i + 1
+        text += self.tokenizer.decode_ids(ids[last_i:])
+        return text
+        # return self.tokenizer.decode_ids(ids)
 
     @property
     def cls(self):
@@ -502,8 +823,195 @@ class _GPTSentencePieceTokenizer(_SentencePieceTokenizer):
         return self._eos_id
 
     @property
+    def bos(self):
+        return self._bos_id
+
+    @property
     def additional_special_tokens_ids(self):
         return None
+
+
+class _LLaMaSentencePieceTokenizer(_GPTSentencePieceTokenizer):
+    """SentencePieceTokenizer-Megatron wrapper"""
+
+    def _initalize(self, vocab_extra_ids):
+        self._populate_vocab()
+        self._special_tokens = {}
+        self._inv_special_tokens = {}
+
+        # self._pad_id = self.tokenizer.pad_id()
+        # self._bos_id = self.tokenizer.bos_id()
+        # self._eos_id = self.tokenizer.eos_id()
+        
+        def _add_special_token(t):
+            if t not in self._vocab:
+                next_id = len(self._vocab)
+                self._vocab[t] = next_id
+                self._inv_vocab[next_id] = t
+            self._special_tokens[t] = self._vocab[t]
+            self._inv_special_tokens[self._vocab[t]] = t
+        
+        # Set pad id / bos id / eos id
+        self._pad_id = 0
+        bos_id = self.tokenizer.bos_id()
+        try:
+            bos_token = self.tokenizer.id_to_piece(bos_id)
+        except IndexError:
+            bos_token = "<s>"
+        _add_special_token(bos_token)
+        self._bos_id = self._vocab[bos_token]
+
+        eos_id = self.tokenizer.eos_id()
+        try:
+            eos_token = self.tokenizer.id_to_piece(eos_id)
+        except IndexError:
+            eos_token = "</s>"
+        _add_special_token(eos_token)
+        self._eos_id = self._vocab[eos_token]
+
+
+class _UL2SentencePieceTokenizer(_SentencePieceTokenizer):
+    """SentencePieceTokenizer-Megatron wrapper"""
+
+    def __init__(self, model_file, vocab_extra_ids):
+        super().__init__(model_file, vocab_extra_ids=vocab_extra_ids)
+
+    def _initalize(self, vocab_extra_ids):
+        self._populate_vocab()
+        self._special_tokens = {}
+        self._inv_special_tokens = {}
+        self._t5_tokens = []
+
+        # self._pad_id = self.tokenizer.pad_id()
+        # self._bos_id = self.tokenizer.bos_id()
+        # self._eos_id = self.tokenizer.eos_id()
+        
+        def _add_special_token(t):
+            if t not in self._vocab:
+                next_id = len(self._vocab)
+                self._vocab[t] = next_id
+                self._inv_vocab[next_id] = t
+            self._special_tokens[t] = self._vocab[t]
+            self._inv_special_tokens[self._vocab[t]] = t
+        
+        # self._pad_id = self.tokenizer.pad_id()
+        self._pad_id = 0
+
+        bos_id = self.tokenizer.bos_id()
+        try:
+            bos_token = self.tokenizer.id_to_piece(bos_id)
+        except IndexError:
+            bos_token = "<BOS>"
+        _add_special_token(bos_token)
+        self._bos_id = self._vocab[bos_token]
+
+        eos_id = self.tokenizer.eos_id()
+        try:
+            eos_token = self.tokenizer.id_to_piece(eos_id)
+        except IndexError:
+            eos_token = "<EOS>"
+        _add_special_token(eos_token)
+        self._eos_id = self._vocab[eos_token]
+        _add_special_token("[X]")
+        _add_special_token("[S]")
+        _add_special_token("[R]")
+        _add_special_token("<pad>")
+        self._t5_tokens += ["[X]", "[S]", "[R]", "<pad>"]
+        pad_token = "<pad>"
+        self._pad_id = self._vocab[pad_token]
+        for i in range(vocab_extra_ids):
+            t = "<extra_id_{}>".format(i)
+            _add_special_token(t)
+            self._t5_tokens += [t]
+
+    def tokenize(self, text, bos=False, eos=False):
+        ids = []
+        idx = 0
+
+        if bos:
+            ids.append(self._bos_id)
+
+        while 1:
+            indices = {}
+            for token in self._special_tokens:
+                try:
+                    indices[token] = text[idx:].index(token)
+                except ValueError:
+                    continue
+            if len(indices) == 0:
+                break
+
+            next_token = min(indices, key=indices.get)
+            next_idx = idx + indices[next_token]
+
+            ids.extend(self.tokenizer.encode_as_ids(text[idx:next_idx]))
+            ids.append(self._special_tokens[next_token])
+            idx = next_idx + len(next_token)
+
+        ids.extend(self.tokenizer.encode_as_ids(text[idx:]))
+        
+        if eos:
+            ids.append(self._eos_id)
+
+        return ids
+
+    def detokenize(self, ids):
+        text = ""
+        last_i = 0
+
+        for i, id in enumerate(ids):
+            if id in self._inv_special_tokens:
+                text += self.tokenizer.decode_ids(ids[last_i:i]) # + " "
+                text += self._inv_special_tokens[id] # + " "
+                last_i = i + 1
+        text += self.tokenizer.decode_ids(ids[last_i:])
+        return text
+    
+    def detokenize_tokens(self, ids):
+        text = ""
+        last_i = 0
+        tokens = []
+
+        for i, id in enumerate(ids):
+            if id in self._inv_special_tokens:
+                c_tokens = [self.tokenizer.id_to_piece(c_id) for c_id in ids[last_i:i].tolist()]
+                tokens.extend(c_tokens)
+                tokens.append(self._inv_special_tokens[id])
+                # print(self._inv_special_tokens[id])
+                # print(ids[last_i:i].tolist())
+                # print([self.tokenizer.id_to_piece(c_id) for c_id in ids[last_i:i].tolist()])
+                # text += self.tokenizer.decode_ids(ids[last_i:i]) + " "
+                # text += self._inv_special_tokens[id] + " "
+                last_i = i + 1
+        c_tokens = [self.tokenizer.id_to_piece(c_id) for c_id in ids[last_i:].tolist()]
+        tokens.extend(c_tokens)
+        # text += self.tokenizer.decode_ids(ids[last_i:])
+        return ''.join(tokens).replace('_', ' ')
+
+    @property
+    def cls(self):
+        return -1
+
+    @property
+    def sep(self):
+        return -1
+
+    @property
+    def mask(self):
+        return -1
+
+    @property
+    def eod(self):
+        return self._eos_id
+
+    @property
+    def bos(self):
+        return self._bos_id
+
+    @property
+    def additional_special_tokens_ids(self):
+        return [self.vocab[k] for k in self._t5_tokens]
+
 
 class _Llama2Tokenizer(_SentencePieceTokenizer):
     """SentencePieceTokenizer-Megatron wrapper"""
@@ -553,6 +1061,7 @@ class _Llama2Tokenizer(_SentencePieceTokenizer):
     @property
     def additional_special_tokens_ids(self):
         return None
+
 
 class _NullTokenizer:
     def __init__(self, vocab_size):

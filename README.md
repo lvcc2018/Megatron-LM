@@ -31,6 +31,7 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
 | 1T    | 56.3% | 57.0% |
 
 # Contents
+   * [Get started fast](#get-started-fast)
    * [Contents](#contents)
    * [Setup](#setup)
       * [Downloading Checkpoints](#downloading-checkpoints)
@@ -59,6 +60,9 @@ The following table shows both model (MFU) and hardware (HFU) FLOPs utilization 
       * [Collecting Wikipedia Training Data](#collecting-wikipedia-training-data)
       * [Collecting GPT Webtext Data](#collecting-gpt-webtext-data)
    * [Reproducibility](#reproducibility)
+
+# Get started fast
+Here is doc with just [instructions to going from 0 to training really fast](quick_run.md).
 
 # Setup
 We strongly recommend using the latest release of [NGC's PyTorch container](https://ngc.nvidia.com/catalog/containers/nvidia:pytorch) with DGX nodes. If you can't use this for some reason, use the latest pytorch, cuda, nccl, and NVIDIA [APEX](https://github.com/NVIDIA/apex#quick-start) releases.  Data preprocessing requires [NLTK](https://www.nltk.org/install.html), though this is not required for training, evaluation, or downstream tasks.

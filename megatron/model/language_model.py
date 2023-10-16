@@ -251,7 +251,7 @@ class Embedding(MegatronModule):
         if self.add_position_embedding:
             state_dict_[self._position_embeddings_key] \
                 = self.position_embeddings.state_dict(prefix=prefix,
-                                                  keep_vars=keep_vars)
+                                                    keep_vars=keep_vars)
         if self.num_tokentypes > 0:
             state_dict_[self._tokentype_embeddings_key] \
                 = self.tokentype_embeddings.state_dict(prefix=prefix,

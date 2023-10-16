@@ -27,7 +27,7 @@ def get_tasks_args(parser):
                        'the data loader')
     group.add_argument('--train-data', nargs='+', default=None,
                        help='Whitespace separated paths or corpora names '
-                       'for training.')
+                       'for training. Weight-1 Name-1 path path path Weight-2 Name-2 path path')
     group.add_argument('--valid-data', nargs='*', default=None,
                        help='path(s) to the validation data.')
     group.add_argument('--overlapping-eval', type=int, default=32,
@@ -70,7 +70,10 @@ def get_tasks_args(parser):
     group.add_argument('--val-av-rank-other-neg', type=int, default=30,
                         help='Av.rank validation: how many other negatives to'
                         ' take from each question pool')
-
+    group.add_argument('--pad-to-max-length', action="store_true", help="Pad each sequence to max length.")
+    group.add_argument('--use-mix-format', action='store_true', help="Whether to use mix format")
+    group.add_argument('--use-cache', action='store_true', help="whether to use cache dataset")
+    group.add_argument('--user-loss-mask', type=float, default=1.0, help="loss mask for user response")
 
     return parser
 
@@ -95,6 +98,8 @@ if __name__ == '__main__':
         from orqa.evaluate_orqa import main
     elif args.task in ['RET-FINETUNE-NQ']:
         from orqa.supervised.finetune import main
+    elif args.task == 'instruction':
+        from instruction.finetune import main
     else:
         raise NotImplementedError('Task {} is not implemented.'.format(
             args.task))

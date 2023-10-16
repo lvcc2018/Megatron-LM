@@ -13,7 +13,7 @@ from datetime import timedelta
 from megatron import fused_kernels
 from megatron import get_adlr_autoresume
 from megatron import get_args
-from megatron import get_tensorboard_writer
+from megatron import get_tensorboard_writer, get_writer
 from megatron.core import mpu, tensor_parallel
 from megatron.arguments import parse_args, validate_args
 from megatron.checkpointing import load_args_from_checkpoint
@@ -253,7 +253,8 @@ def _set_random_seed(seed_, data_parallel_random_init=False):
 def write_args_to_tensorboard():
     """Write arguments to tensorboard."""
     args = get_args()
-    writer = get_tensorboard_writer()
+    # writer = get_tensorboard_writer()
+    writer = get_writer()
     if writer:
         for arg in vars(args):
             writer.add_text(arg, str(getattr(args, arg)), global_step=args.iteration)

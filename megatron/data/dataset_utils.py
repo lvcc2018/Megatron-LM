@@ -79,6 +79,83 @@ def get_datasets_weights_and_num_samples(data_prefix,
 
     return prefixes, weights, datasets_train_valid_test_num_samples
 
+def get_datasets_weights_and_num_samples_withname(data_prefix,
+                                         train_valid_test_num_samples):
+
+    # The data prefix should be in the format of:
+    #   weight-1, data-prefix-1, weight-2, data-prefix-2, ..
+    assert len(data_prefix) % 3 == 0
+    num_datasets = len(data_prefix) // 3
+    weights = [0]*num_datasets
+    prefixes = [0]*num_datasets
+    names = [0]*num_datasets
+    for i in range(num_datasets):
+        weights[i] = float(data_prefix[3*i])
+        names[i] = (data_prefix[3*i+1]).strip()
+        prefixes[i] = (data_prefix[3*i+2]).strip()
+    # Normalize weights
+    weight_sum = 0.0
+    for weight in weights:
+        weight_sum += weight
+    assert weight_sum > 0.0
+    weights = [weight / weight_sum for weight in weights]
+
+    # Add 0.5% (the 1.005 factor) so in case the bleding dataset does
+    # not uniformly distribute the number of samples, we still have
+    # samples left to feed to the network.
+    if isinstance(train_valid_test_num_samples, list):
+        datasets_train_valid_test_num_samples = []
+        for weight in weights:
+            datasets_train_valid_test_num_samples.append(
+                [int(math.ceil(val * weight * 1.005))
+                for val in train_valid_test_num_samples])
+    else:
+        # Used when separate dataset files are provided for train,
+        # valid and test
+        datasets_train_valid_test_num_samples = [
+            int(math.ceil(train_valid_test_num_samples * weight * 1.005))
+            for weight in weights]
+
+    return prefixes, weights, names, datasets_train_valid_test_num_samples
+
+def get_datasets_weights_and_num_samples_for_dataset_manager(data_prefix,
+                                         train_valid_test_num_samples, global_batch_size, train_valid_test_num_iters):
+
+    # The data prefix should be in the format of:
+    #   weight-1, data-prefix-1, weight-2, data-prefix-2, ..
+    assert len(data_prefix) % 3 == 0
+    num_datasets = len(data_prefix) // 3
+    weights = [0]*num_datasets
+    prefixes = [0]*num_datasets
+    names = [0]*num_datasets
+    for i in range(num_datasets):
+        weights[i] = data_prefix[3*i]
+        names[i] = (data_prefix[3*i+1]).strip()
+        prefixes[i] = (data_prefix[3*i+2]).strip()
+    from megatron.data.dataset_manager import WeightScheduler
+    # Add 0.5% (the 1.005 factor) so in case the bleding dataset does
+    # not uniformly distribute the number of samples, we still have
+    # samples left to feed to the network.
+    weight_scheduelrs = []
+    if isinstance(train_valid_test_num_samples, list):
+        datasets_train_valid_test_num_samples = []
+        split_names = ['train', 'valid', 'test']
+        for name, num_iters in zip(split_names, train_valid_test_num_iters):
+            weight_scheduelrs.append(WeightScheduler(weights, names, global_batch_size, num_iters, name))
+        train_valid_test_numbers = [w.get_each_sample_number() for w in weight_scheduelrs]
+        for i in range(len(names)):
+            datasets_train_valid_test_num_samples.append(
+                [numbers[i] for numbers in train_valid_test_numbers])
+    else:
+        # Used when separate dataset files are provided for train,
+        # valid and test
+        # TODO: BUG on weight scheduler
+        datasets_train_valid_test_num_samples = [
+            int(math.ceil(train_valid_test_num_samples * weight * 1.005))
+            for weight in weights]
+
+    return prefixes, weight_scheduelrs, names, datasets_train_valid_test_num_samples
+
 
 def compile_helper():
     """Compile helper function ar runtime. Make sure this

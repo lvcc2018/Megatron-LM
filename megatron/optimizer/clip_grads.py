@@ -5,7 +5,13 @@
 import os
 
 import torch
-from torch import inf
+
+TORCH_MAJOR = int(torch.__version__.split('.')[0])
+TORCH_MINOR = int(torch.__version__.split('.')[1])
+if TORCH_MAJOR == 2:
+    from torch import inf
+else:
+    from torch._six import inf
 
 from apex.multi_tensor_apply import multi_tensor_applier
 import amp_C

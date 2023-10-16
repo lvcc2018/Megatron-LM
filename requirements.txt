@@ -1,0 +1,17 @@
+datasets
+nltk
+numpy==1.23.5
+parameterized
+pybind11
+regex
+six
+tensorboard
+torch
+transformers
+black
+isort
+flash-attn
+ninja
+sentencepiece
+flask
+flask-restful

@@ -807,7 +807,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         ranks.
 
         Additionally, return references to the entire buffers, for use
-        in _reduce_scatter_base and _all_gather_base.
+        in reduce_scatter_tensor and all_gather_into_tensor.
         """
 
         # Buffer views.

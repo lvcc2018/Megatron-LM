@@ -79,6 +79,78 @@ void build_blending_indices(py::array_t<int16_t>& dataset_index,
 
 }
 
+py::tuple build_sample_idx_ul2(const py::array_t<int32_t>& sizes_,
+                           const py::array_t<int32_t>& doc_idx_,
+                           std::vector<int32_t>& seq_length_per_sample,
+                           std::vector<int32_t>& denoisers,
+                           const int32_t seed,
+                           int64_t remain_tokens) {
+    // Consistency checks.
+    assert(seed >= 0);
+    assert(denoisers.size() == seq_length_per_sample.size());
+
+    // Remove bound checks.
+    auto sizes = sizes_.unchecked<1>();
+    auto doc_idx = doc_idx_.unchecked<1>();
+
+    std::vector<int32_t> denoisers_info = {1860, 1973, 1535, 1819, 2037, 2015, 2048};
+    std::mt19937 rng(seed);
+    std::uniform_int_distribution<> distr(0, 6);
+
+    // Correct num_samples by continuously sampling the denoiser.
+    while (remain_tokens > 0) {
+        int32_t denoiser = distr(rng);
+        int32_t seq_length = denoisers_info[denoiser];
+        denoisers.push_back(denoiser);
+        seq_length_per_sample.push_back(seq_length);
+        remain_tokens -= seq_length;
+    }
+
+    int64_t num_samples = denoisers.size();
+    int32_t* sample_idx = new int32_t[2*(num_samples+1)];
+
+    int64_t sample_index = 0;
+    int64_t doc_idx_index = 0;
+    int32_t doc_offset = 0;
+
+    sample_idx[2 * sample_index] = doc_idx_index;
+    sample_idx[2 * sample_index + 1] = doc_offset;
+    ++sample_index;
+
+    while (sample_index <= num_samples) {
+        int32_t remaining_seq_length = seq_length_per_sample[sample_index - 1];
+        while (remaining_seq_length != 0) {
+            auto doc_id = doc_idx[doc_idx_index];
+            auto doc_length = sizes[doc_id] - doc_offset;
+
+            remaining_seq_length -= doc_length;
+
+            if (remaining_seq_length <= 0) {
+                doc_offset += (remaining_seq_length + doc_length - 1);
+                remaining_seq_length = 0;
+            } else {
+                ++doc_idx_index;
+                doc_offset = 0;
+            }
+        }
+
+        sample_idx[2 * sample_index] = doc_idx_index;
+        sample_idx[2 * sample_index + 1] = doc_offset;
+        ++sample_index;
+    }
+
+    py::capsule free_when_done(sample_idx, [](void *f) {
+        delete[] reinterpret_cast<int32_t *>(f);
+    });
+
+    const auto byte_size = sizeof(int32_t);
+    auto sample_idx_array = py::array(std::vector<int64_t>{num_samples+1, 2},
+                                      {2*byte_size, byte_size},
+                                      sample_idx,
+                                      free_when_done);
+
+    return py::make_tuple(sample_idx_array, denoisers, seq_length_per_sample);
+}
 
 py::array build_sample_idx(const py::array_t<int32_t>& sizes_,
 			   const py::array_t<int32_t>& doc_idx_,
@@ -697,5 +769,6 @@ PYBIND11_MODULE(helpers, m) {
     m.def("build_mapping", &build_mapping);
     m.def("build_blocks_mapping", &build_blocks_mapping);
     m.def("build_sample_idx", &build_sample_idx);
+    m.def("build_sample_idx_ul2", &build_sample_idx_ul2);
     m.def("build_blending_indices", &build_blending_indices);
 }

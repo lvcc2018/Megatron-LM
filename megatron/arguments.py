@@ -184,6 +184,9 @@ def validate_args(args, defaults={}):
     # Consumed tokens.
     args.consumed_train_samples = 0
     args.consumed_valid_samples = 0
+    if args.use_dataloader_manager or args.use_dataset_manager:
+        args.consumed_train_samples_per_dataset = {}
+        args.consumed_valid_samples_per_dataset = {}
 
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
@@ -710,6 +713,13 @@ def _add_regularization_args(parser):
                        'numerical stability')
     group.add_argument('--sgd-momentum', type=float, default=0.9,
                        help='Momentum factor for sgd')
+    
+    group.add_argument('--fixed-params', nargs='*',
+                       help='Names of params that need to be fixed')
+    group.add_argument('--trainable-params', nargs='*',
+                       help='Names of params that need to be trainable')
+    group.add_argument('--keep-res-trainable', type=bool, default=True,
+                       help='Whether to keep the other params trainable')
     return parser
 
 
@@ -1155,7 +1165,10 @@ def _add_data_args(parser):
                                 'BertWordPieceCase',
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
+                                'MixedTokenizer',
                                 'GPTSentencePieceTokenizer',
+                                'LLaMaSentencePieceTokenizer',
+                                'UL2SentencePieceTokenizer',
                                 'Llama2Tokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
@@ -1168,6 +1181,10 @@ def _add_data_args(parser):
                        'end-of-document token.')
     group.add_argument('--eod-mask-loss', action='store_true',
                        help='Mask loss for the end of document tokens.')
+    group.add_argument('--use-dataloader-manager', action='store_true',
+                       help='Whether use dataloader manager to sample data.')
+    group.add_argument('--use-dataset-manager', action='store_true',
+                       help='Whether use dataloader manager to sample data.')
 
     return parser
 

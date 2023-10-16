@@ -20,6 +20,8 @@ from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu, get
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region_to_moe, reduce_scatter_to_sequence_parallel_region_from_moe
 from megatron.core.parallel_state import get_tensor_model_parallel_group, get_tensor_and_expert_parallel_group
 
+from .module import MegatronModule
+
 try:
     from einops import rearrange
 except ImportError:
@@ -32,6 +34,11 @@ except ImportError:
         from flash_attn.flash_attn_interface import flash_attn_varlen_func as flash_attn_unpadded_func
     except ImportError:
         flash_attn_unpadded_func = None
+
+try:
+    from apex.normalization import MixedFusedRMSNorm
+except ImportError:
+    MixedFusedRMSNorm = None
 
 """ We use the following notation throughout this file:
      h: hidden size
@@ -1166,7 +1173,7 @@ class ParallelTransformerLayer(MegatronModule):
                     residual,
                     self.hidden_dropout)
         else:
-            out = torch.nn.functional.dropout(attention_output + attention_bias,
+            out = torch.nn.functional.dropout(attention_output + attention_bias if attention_bias is not None else attention_output,
                                               p=self.hidden_dropout,
                                               training=self.training)
             norm_input = residual + self.drop_path(out)

@@ -57,6 +57,19 @@ def openai_gelu(x):
 def erf_gelu(x):
     return x * 0.5 * (torch.erf(x / 1.41421).to(dtype=x.dtype)+torch.ones_like(x).to(dtype=x.dtype))
 
+def fix_model_params(model, fixed_params=[], trainable_params=[], keep_res_trainable=True):
+    if not isinstance(model, list):
+        model = [model]
+    for module in model:
+        for name, param in module.named_parameters():
+            if name in fixed_params:
+                param.requires_grad = False
+            elif name in trainable_params:
+                param.requires_grad = True
+            elif keep_res_trainable:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
 
 def get_norm(config):
     args = get_args()

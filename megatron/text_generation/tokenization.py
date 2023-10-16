@@ -98,7 +98,7 @@ def _tokenize_prompts_and_batch(prompts, tokens_to_generate, add_BOS):
     # Tokenize all the prompts.
     tokenizer = get_tokenizer()
     if add_BOS:
-        prompts_tokens = [[tokenizer.eod] + tokenizer.tokenize(prompt)
+        prompts_tokens = [[tokenizer.bos] + tokenizer.tokenize(prompt)
                           for prompt in prompts]
     else:
         prompts_tokens = [tokenizer.tokenize(prompt) for prompt in prompts]

@@ -85,6 +85,75 @@ def score_and_return_on_first_stage(model, tokens, lengths):
     
     return tokens, lengths, output_log_probs, logits
 
+
+def logit_and_return_on_first_stage(model, tokens, lengths):
+    """Function for getting the logits.
+    Arguments:
+        model: no interleaving is supported.
+        tokens: prompt tokens extended to be of size [b, max_prompt_length]
+        lengths: original prompt length, size: [b]
+    Note: Outside of model, other parameters only need to be available on
+          rank 0.
+    Outputs: 
+        logits: logits of the all input tokens. size: [b, s, v]
+        next_logits: logits of the next token. size: [b, v]
+    """
+
+    args = get_args()
+
+    batch_size = tokens.size(0)
+    max_prompt_length = lengths.max().item()
+    assert max_prompt_length == tokens.size(1)
+    
+    if max_prompt_length > args.max_position_embeddings:
+        raise ValueError("Length of prompt + tokens_to_generate longer than allowed")
+    
+    if max_prompt_length * batch_size > args.max_tokens_to_oom:
+        raise ValueError("Too many tokens.  " + str(max_prompt_length*batch_size)+ " is greater than "+str(args.max_tokens_to_oom))
+
+    # forward step.
+    forward_step = ForwardStep(model, batch_size, max_prompt_length)
+
+    # ===================
+    # Pre-allocate memory
+    # ===================
+
+    # Logits of the sequence (prompt + generated tokens).
+    output_logits = None
+    output_logits_size = (batch_size, max_prompt_length - 1)
+    
+    if mpu.is_pipeline_last_stage():
+        output_logits = torch.empty(output_logits_size,
+                                       dtype=torch.float32,
+                                       device=torch.cuda.current_device())
+    
+    # =============
+    # Run infernece
+    # =============
+    with torch.no_grad():
+        attention_mask, position_ids = _build_attention_mask_and_position_ids(tokens)
+        
+        # logits will be meanigful only in the last pipeline stage.
+        logits = forward_step(tokens, position_ids, attention_mask)
+
+        if mpu.is_pipeline_last_stage():
+            # Always the last stage should have an output.
+            assert logits is not None
+            
+            # Pick the tokens that we need to get the log
+            # probabilities for. Note that next input token is
+            # the token which we selected in the current logits,
+            # so shift by 1.
+            output_logits = logits
+    
+    # ======================================
+    # Broadcast to the first pipeline stage.
+    # ======================================
+    output_logits = broadcast_from_last_to_first_pipeline_stage(
+        output_logits_size, torch.float32, output_logits)
+    
+    return output_logits
+
 def generate_tokens_probs_and_return_on_first_stage(
         model, tokens, lengths,
         return_output_log_probs=False,

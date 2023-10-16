@@ -8,12 +8,17 @@ import time
 
 import numpy as np
 import torch
+from tqdm import tqdm
 
 from megatron import print_rank_0
 from megatron.core import mpu
 from megatron.data.blendable_dataset import BlendableDataset
 from megatron.data.dataset_utils import get_datasets_weights_and_num_samples
+from megatron.data.dataset_utils import get_datasets_weights_and_num_samples_withname
+from megatron.data.dataset_utils import get_datasets_weights_and_num_samples_for_dataset_manager
 from megatron.data.dataset_utils import get_train_valid_test_split_
+from megatron.data.indexed_dataset import make_dataset as make_indexed_dataset
+from megatron.data.dataset_manager import DatasetManager, WeightScheduler
 from megatron.data.indexed_dataset import MMapIndexedDataset
 
 
@@ -23,9 +28,14 @@ def build_train_valid_test_datasets(data_prefix, splits_string,
                                     train_data_prefix=None,
                                     valid_data_prefix=None,
                                     test_data_prefix=None,
-                                    return_doc_ids=False, *,
+                                    return_doc_ids=False,
+                                    use_dataloader_manager=False,
+                                    use_dataset_manager=False,
+                                    global_batch_size=None, *,
                                     data_cache_path=None):
     """Build train, valid, and test datasets."""
+    if use_dataset_manager:
+        train_valid_test_num_iters = [num_samples // global_batch_size for num_samples in train_valid_test_num_samples]
 
     if data_prefix:
         print_rank_0("Single data path provided for train, valid & test")
@@ -36,13 +46,25 @@ def build_train_valid_test_datasets(data_prefix, splits_string,
                                                     splits_string,
                                                     train_valid_test_num_samples,
                                                     seq_length, seed, skip_warmup,
-                                                    data_cache_path=data_cache_path)
+                                                    data_cache_path=data_cache_path,
+                                                    return_doc_ids=return_doc_ids)
 
         # Blending dataset.
         # Parse the values.
-        output = get_datasets_weights_and_num_samples(data_prefix,
-                                                      train_valid_test_num_samples)
-        prefixes, weights, datasets_train_valid_test_num_samples = output
+        if use_dataloader_manager:
+            output = get_datasets_weights_and_num_samples_withname(data_prefix,
+                                                    train_valid_test_num_samples)
+            prefixes, weights, names, datasets_train_valid_test_num_samples = output
+        elif use_dataset_manager:
+            output = get_datasets_weights_and_num_samples_for_dataset_manager(data_prefix,
+                                                    train_valid_test_num_samples, global_batch_size, 
+                                                    train_valid_test_num_iters)
+            prefixes, weight_schedulers, names, datasets_train_valid_test_num_samples = output
+        else:
+            output = get_datasets_weights_and_num_samples(data_prefix,
+                                                        train_valid_test_num_samples)
+            prefixes, weights, datasets_train_valid_test_num_samples = output
+        
         train_num_samples, valid_num_samples, test_num_samples = map(
             sum,
             zip(*datasets_train_valid_test_num_samples)
@@ -65,6 +87,26 @@ def build_train_valid_test_datasets(data_prefix, splits_string,
                 valid_datasets.append(valid_ds)
             if test_ds:
                 test_datasets.append(test_ds)
+        
+        if use_dataloader_manager:
+            # We will use DataLoaderManager, so no need to blend here.
+            return ((train_datasets, weights, names), (valid_datasets, weights, names), (test_datasets, weights, names))
+        
+        if use_dataset_manager:
+            # We will use DatasetManager, so no need to blend here.
+            if any(train_datasets):
+                train_dataset = DatasetManager(names, train_datasets, weight_schedulers[0], global_batch_size, train_valid_test_num_iters[0])
+            else:
+                train_dataset = None
+            if any(valid_datasets):
+                valid_dataset = DatasetManager(names, valid_datasets, weight_schedulers[1], global_batch_size, train_valid_test_num_iters[1])
+            else:
+                valid_dataset = None
+            if any(test_datasets):
+                test_dataset = DatasetManager(names, test_datasets, weight_schedulers[2], global_batch_size, train_valid_test_num_iters[2])
+            else:
+                test_dataset = None
+            return (train_dataset, valid_dataset, test_dataset)
 
         # Blend.
         blending_train_dataset = None
@@ -188,8 +230,9 @@ def build_dataset(dataset_name, data_prefix,
                 datasets.append(ds)
 
         if datasets:
-            dataset = BlendableDataset(datasets, weights, num_samples,
-                                       data_cache_path=data_cache_path)
+            dataset = (datasets, weights)
+            # We will use DataLoaderManager, so no need to blend here.
+            # dataset = BlendableDataset(datasets, weights)
 
     return dataset
 
@@ -247,6 +290,7 @@ class GPTDataset(torch.utils.data.Dataset):
         self.name = name
         self.indexed_dataset = indexed_dataset
         self.return_doc_ids = return_doc_ids
+        self.seq_length = seq_length
 
         # Checks
         assert np.min(documents) >= 0
@@ -265,6 +309,45 @@ class GPTDataset(torch.utils.data.Dataset):
         #    sample i --> [sample_idx[i], sample_idx[i+1])
         return self.sample_idx.shape[0] - 1
 
+    def doc_id_to_idx(self, doc_id):
+        """Given a document id, return the corresponding index."""
+        # Find the positions of doc_id in self.doc_idx
+        doc_indexs = np.where(self.doc_idx == doc_id)[0]
+        def binary_search_first_match(doc_indexs, sample_idx):
+            matching_indexs = []
+            for doc_index in doc_indexs:
+                left, right = 0, len(sample_idx) - 1
+                matching_index = -1
+                while left <= right:
+                    mid = left + (right - left) // 2
+                    if sample_idx[mid][0] <= doc_index:
+                        matching_index = mid
+                        left = mid + 1
+                    else:
+                        right = mid - 1
+                matching_indexs.append(matching_index)
+            return matching_indexs
+        # Continue searching for the position of doc_indices in self.sample_idx
+        matching_indexs = binary_search_first_match(doc_indexs, self.sample_idx)
+        # There may be multiple samples using the same document
+        sample_indexs = []
+        for (i, matching_index) in enumerate(matching_indexs):
+            if self.sample_idx[matching_index][0] < doc_indexs[i]:
+                sample_indexs.append(matching_index)
+                continue
+            tmp_index = matching_index
+            while tmp_index >= 0 and self.sample_idx[tmp_index][0] == doc_indexs[i]:
+                sample_indexs.append(tmp_index)
+                tmp_index -= 1
+            if tmp_index >= 0 and self.sample_idx[tmp_index + 1][1] > 0:
+                sample_indexs.append(tmp_index)
+        sample_indexs = np.unique(np.array(sample_indexs))
+        shuffle_indexs = []
+        # Finally, reverse lookup the shuffled indices
+        for sample_index in tqdm(sample_indexs, desc=f"Processing for Doc id {doc_id}", ncols=100):
+            shuffle_indexs.append(np.where(self.shuffle_idx == sample_index)[0][0])
+        return shuffle_indexs
+    
     def __getitem__(self, idx):
         # Get the shuffled index.
         idx = self.shuffle_idx[idx]
@@ -295,12 +378,18 @@ class GPTDataset(torch.utils.data.Dataset):
                 self.doc_idx[doc_index_l],
                 length=offset_l + 1))
             sample = np.concatenate(sample_list)
+        loss_mask = [1] * (len(sample) - 1) + [0] * (self.seq_length + 1 - len(sample))
+        pad_tokens = [0] * (self.seq_length + 1 - len(sample))
+        pad_tokens = np.array(pad_tokens, dtype=sample.dtype)
+        sample = np.concatenate((sample, pad_tokens))
 
         if self.return_doc_ids: # for retro preprocessing
             return {'text': np.array(sample, dtype=np.int64),
+                    'loss_mask': np.array(loss_mask, dtype=np.int64),
                     'doc_ids': np.array(doc_ids, dtype=np.int64)}
         else:
-            return {'text': np.array(sample, dtype=np.int64)}
+            return {'text': np.array(sample, dtype=np.int64),
+                    'loss_mask': np.array(loss_mask, dtype=np.int64)}
 
 
 def _build_index_mappings(name, data_prefix, documents, sizes,
@@ -498,69 +587,102 @@ def _num_epochs(tokens_per_epoch, seq_length, num_samples):
             return num_epochs
 
 
+# Iterative version (Recommended)
 def _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch):
-    """Build an array with length = number-of-epochs * number-of-dcuments.
+    """Build an array with length = number-of-epochs * number-of-documents.
     Each index is mapped to a corresponding document."""
-    if not separate_last_epoch or num_epochs == 1:
-        doc_idx = np.mgrid[0:num_epochs, 0:len(documents)][1]
-        doc_idx[:] = documents
-        doc_idx = doc_idx.reshape(-1)
-        doc_idx = doc_idx.astype(np.int32)
+
+    doc_idx = np.tile(documents, num_epochs)
+    if num_epochs > 1 and separate_last_epoch:
+        np_rng.shuffle(doc_idx[:-len(documents)])
+        np_rng.shuffle(doc_idx[-len(documents):])
+    else:
         np_rng.shuffle(doc_idx)
-        return doc_idx
 
-    doc_idx_first = _build_doc_idx(documents, num_epochs-1, np_rng, False)
-    doc_idx_last = _build_doc_idx(documents, 1, np_rng, False)
-    return np.concatenate((doc_idx_first, doc_idx_last))
+    return doc_idx.astype(np.int32)
 
 
-def _build_sample_idx(sizes, doc_idx, seq_length,
-                      num_epochs, tokens_per_epoch):
-    """Sample index mapping is a 2D array with sizes
-    [number-of-samples + 1, 2] where [..., 0] contains
-    the index into `doc_idx` and [..., 1] is the
-    starting offset in that document."""
+# Recursive version (If the number of epochs is very large, this could lead to a stack overflow)
+# def _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch):
+#     """Build an array with length = number-of-epochs * number-of-documents.
+#     Each index is mapped to a corresponding document."""
 
-    # Total number of samples. For -1 see comments in `_num_epochs`.
-    num_samples = (num_epochs * tokens_per_epoch - 1) // seq_length
-    sample_idx = np.zeros([num_samples + 1, 2], dtype=np.int32)
+#     if not separate_last_epoch or num_epochs == 1:
+#         doc_idx = np.tile(documents, num_epochs)
+#         np_rng.shuffle(doc_idx)
+#         return doc_idx.astype(np.int32)
 
-    # Index into sample_idx.
-    sample_index = 0
-    # Index into doc_idx.
-    doc_idx_index = 0
-    # Begining offset for each document.
-    doc_offset = 0
-    # Start with first document and no offset.
-    sample_idx[sample_index][0] = doc_idx_index
-    sample_idx[sample_index][1] = doc_offset
-    sample_index += 1
-    while sample_index <= num_samples:
-        # Start with a fresh sequence.
-        remaining_seq_length = seq_length + 1
-        while remaining_seq_length != 0:
-            # Get the document length.
-            doc_id = doc_idx[doc_idx_index]
-            doc_length = sizes[doc_id] - doc_offset
-            # And add it to the current sequence.
-            remaining_seq_length -= doc_length
-            # If we have more than a full sequence, adjust offset and set
-            # remaining length to zero so we return from the while loop.
-            # Note that -1 here is for the same reason we have -1 in
-            # `_num_epochs` calculations.
-            if remaining_seq_length <= 0:
-                doc_offset += (remaining_seq_length + doc_length - 1)
-                remaining_seq_length = 0
-            else:
-                # Otherwise, start from the begining of the next document.
-                doc_idx_index += 1
-                doc_offset = 0
-        # Record the sequence.
-        sample_idx[sample_index][0] = doc_idx_index
-        sample_idx[sample_index][1] = doc_offset
-        sample_index += 1
+#     doc_idx_first = _build_doc_idx(documents, num_epochs - 1, np_rng, False)
+#     doc_idx_last = _build_doc_idx(documents, 1, np_rng, False)
 
-    return sample_idx
+#     return np.concatenate([doc_idx_first, doc_idx_last])
+
+
+# Original version: Deprecated.
+# def _build_doc_idx(documents, num_epochs, np_rng, separate_last_epoch):
+#     """Build an array with length = number-of-epochs * number-of-dcuments.
+#     Each index is mapped to a corresponding document."""
+#     if not separate_last_epoch or num_epochs == 1:
+#         doc_idx = np.mgrid[0:num_epochs, 0:len(documents)][1]
+#         doc_idx[:] = documents
+#         doc_idx = doc_idx.reshape(-1)
+#         doc_idx = doc_idx.astype(np.int32)
+#         np_rng.shuffle(doc_idx)
+#         return doc_idx
+
+#     doc_idx_first = _build_doc_idx(documents, num_epochs-1, np_rng, False)
+#     doc_idx_last = _build_doc_idx(documents, 1, np_rng, False)
+#     return np.concatenate((doc_idx_first, doc_idx_last))
+
+
+# Since the C++ optimization interface is provided in helpers.cpp, this function is temporarily deprecated.
+# def _build_sample_idx(sizes, doc_idx, seq_length,
+#                       num_epochs, tokens_per_epoch):
+#     """Sample index mapping is a 2D array with sizes
+#     [number-of-samples + 1, 2] where [..., 0] contains
+#     the index into `doc_idx` and [..., 1] is the
+#     starting offset in that document."""
+
+#     # Total number of samples. For -1 see comments in `_num_epochs`.
+#     num_samples = (num_epochs * tokens_per_epoch - 1) // seq_length
+#     sample_idx = np.zeros([num_samples + 1, 2], dtype=np.int32)
+
+#     # Index into sample_idx.
+#     sample_index = 0
+#     # Index into doc_idx.
+#     doc_idx_index = 0
+#     # Begining offset for each document.
+#     doc_offset = 0
+#     # Start with first document and no offset.
+#     sample_idx[sample_index][0] = doc_idx_index
+#     sample_idx[sample_index][1] = doc_offset
+#     sample_index += 1
+#     while sample_index <= num_samples:
+#         # Start with a fresh sequence.
+#         remaining_seq_length = seq_length + 1
+#         while remaining_seq_length != 0:
+#             # Get the document length.
+#             doc_id = doc_idx[doc_idx_index]
+#             doc_length = sizes[doc_id] - doc_offset
+#             # And add it to the current sequence.
+#             remaining_seq_length -= doc_length
+#             # If we have more than a full sequence, adjust offset and set
+#             # remaining length to zero so we return from the while loop.
+#             # Note that -1 here is for the same reason we have -1 in
+#             # `_num_epochs` calculations.
+#             if remaining_seq_length <= 0:
+#                 doc_offset += (remaining_seq_length + doc_length - 1)
+#                 remaining_seq_length = 0
+#             else:
+#                 # Otherwise, start from the begining of the next document.
+#                 doc_idx_index += 1
+#                 doc_offset = 0
+#         # Record the sequence.
+#         sample_idx[sample_index][0] = doc_idx_index
+#         sample_idx[sample_index][1] = doc_offset
+#         sample_index += 1
+
+#     return sample_idx
 
 
 def _build_shuffle_idx(num_samples, total_size, np_rng):

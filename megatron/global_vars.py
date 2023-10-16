@@ -10,12 +10,14 @@ from megatron import dist_signal_handler
 from megatron.tokenizer import build_tokenizer
 from .microbatches import build_num_microbatches_calculator
 from .timers import Timers
+from megatron.writer import Writer
 
 _GLOBAL_ARGS = None
 _GLOBAL_RETRO_ARGS = None
 _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
 _GLOBAL_TOKENIZER = None
-_GLOBAL_TENSORBOARD_WRITER = None
+# _GLOBAL_TENSORBOARD_WRITER = None
+_GLOBAL_WRITER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
 _GLOBAL_SIGNAL_HANDLER = None
@@ -55,6 +57,11 @@ def get_tensorboard_writer():
     to check if it is initialized."""
     return _GLOBAL_TENSORBOARD_WRITER
 
+def get_writer():
+    """Return writer. It can be None so no need
+    to check if it is initialized."""
+    return _GLOBAL_WRITER
+
 
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
@@ -91,7 +98,8 @@ def set_global_variables(args, build_tokenizer=True):
     _build_num_microbatches_calculator(args)
     if build_tokenizer:
         _ = _build_tokenizer(args)
-    _set_tensorboard_writer(args)
+    # _set_tensorboard_writer(args)
+    _set_writer(args)
     _set_adlr_autoresume(args)
     _set_timers(args)
 
@@ -151,6 +159,16 @@ def _set_tensorboard_writer(args):
             print('WARNING: TensorBoard writing requested but is not '
                   'available (are you using PyTorch 1.1.0 or later?), '
                   'no TensorBoard logs will be written.', flush=True)
+
+def _set_writer(args):
+    """Set writer."""
+    global _GLOBAL_WRITER
+    _ensure_var_is_not_initialized(_GLOBAL_WRITER, 'writer')
+
+    wandb_project = os.environ.get('WANDB_PROJECT', None)
+    if ((hasattr(args, 'tensorboard_dir') and args.tensorboard_dir) or wandb_project is not None) \
+        and args.rank == (args.world_size - 1):
+        _GLOBAL_WRITER = Writer(args=args)
 
 
 def _set_adlr_autoresume(args):
